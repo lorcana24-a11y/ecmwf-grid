@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install ecmwf-opendata ecmwflibs eccodes numpy
-      - run: python ecmwf_fetch.py --out site/ecmwf_grid.js
+      - run: python ecmwf_fetch.py --bbox 0 -170 80 65 --res 0.75 --out site/ecmwf_grid.js
       - run: echo "ECMWF grid for weather.html" > site/index.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
