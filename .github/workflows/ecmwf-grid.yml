@@ -1,0 +1,36 @@
+# GitHub Actions workflow: builds ecmwf_grid.js from ECMWF open data every 6 hours and
+# publishes it with GitHub Pages. Save as  .github/workflows/ecmwf-grid.yml  in a PUBLIC repo that
+# also contains ecmwf_fetch.py at the top level. Then: Settings > Pages > Source: "GitHub Actions".
+name: ECMWF grid
+on:
+  schedule:
+    - cron: '0 3,9,15,21 * * *'   # ECMWF runs 00/06/12/18 UTC are available ~7-8 h later
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ecmwf-opendata ecmwflibs eccodes numpy
+      - run: python ecmwf_fetch.py --out site/ecmwf_grid.js
+      - run: echo "ECMWF grid for weather.html" > site/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
