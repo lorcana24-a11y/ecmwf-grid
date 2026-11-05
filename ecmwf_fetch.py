@@ -170,6 +170,46 @@ def read_grib(path, grid, bbox, res):
     return fields
 
 
+
+FRZ_LEVELS = [1000, 925, 850, 700, 600, 500]
+
+
+def read_grib_levels(path, grid, bbox, res):
+    """Like read_grib but keyed by (pressure level hPa, step)."""
+    from eccodes import codes_grib_new_from_file, codes_get, codes_get_values, codes_release
+    fields = {}
+    with open(path, 'rb') as f:
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            try:
+                step, lev = int(codes_get(gid, 'endStep')), int(codes_get(gid, 'level'))
+                ni, nj = int(codes_get(gid, 'Ni')), int(codes_get(gid, 'Nj'))
+                if not grid.ready:
+                    grid.setup(codes_get(gid, 'latitudeOfFirstGridPointInDegrees'),
+                               codes_get(gid, 'latitudeOfLastGridPointInDegrees'),
+                               codes_get(gid, 'longitudeOfFirstGridPointInDegrees'),
+                               codes_get(gid, 'longitudeOfLastGridPointInDegrees'), ni, nj, bbox, res)
+                fields[(lev, step)] = grid.apply(codes_get_values(gid).reshape(nj, ni).astype(np.float32))
+            finally:
+                codes_release(gid)
+    return fields
+
+
+def freezing_from_levels(T, Z):
+    """T: kelvin, Z: geopotential height in metres; both lists ordered from 1000 hPa upward (same shape).
+    Returns the height (m) of the lowest 0 C crossing; 0 if it is below the 1000 hPa level, top level if always above 0 C."""
+    T, Z = np.stack(T), np.stack(Z)
+    out = np.where(T[0] <= 273.15, 0.0, np.nan).astype(np.float32)
+    for i in range(len(T) - 1):
+        t0, t1, z0, z1 = T[i], T[i + 1], Z[i], Z[i + 1]
+        cross = np.isnan(out) & (t0 > 273.15) & (t1 <= 273.15)
+        frac = np.where(cross, (t0 - 273.15) / np.where(t0 == t1, 1, t0 - t1), 0)
+        out = np.where(cross, z0 + frac * (z1 - z0), out)
+    return np.where(np.isnan(out), Z[-1], out).astype(np.float32)   # warm all the way up: use the top level
+
+
 def download(args):
     try:
         from ecmwf.opendata import Client
@@ -224,6 +264,24 @@ def download(args):
                 if os.path.exists(target):
                     os.remove(target)
                 print(f'  {key}: "{sn}" not usable ({str(e)[:120]})')
+    if 'deg0l' not in got:   # not in the open data: work it out from temperature + height on pressure levels
+        try:
+            lv = {}
+            for sn in ('t', 'gh'):
+                target = os.path.join(args.cache, f'{tag}_pl_{sn}.grib2')
+                if not os.path.exists(target):
+                    print(f'Downloading {sn} on pressure levels {FRZ_LEVELS} ({len(steps)} steps)...')
+                    client.retrieve(param=sn, levtype='pl', levelist=FRZ_LEVELS, target=target, **req)
+                lv[sn] = read_grib_levels(target, grid, args.bbox, args.res)
+            per_step = []
+            for s_ in steps:
+                T = [lv['t'][(L_, s_)] for L_ in FRZ_LEVELS]
+                Z = [lv['gh'][(L_, s_)] for L_ in FRZ_LEVELS]
+                per_step.append(freezing_from_levels(T, Z))
+            got['deg0l'] = np.stack(per_step)
+            print('  deg0l: computed from temperature and height on pressure levels')
+        except Exception as e:
+            print(f'  deg0l: could not be worked out ({str(e)[:160]})')
     if '2t' not in got:
         sys.exit('Temperature (2t) could not be downloaded, so nothing was written. Check your connection / --source.')
     if run is None:
