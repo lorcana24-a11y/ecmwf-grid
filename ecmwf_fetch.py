@@ -19,8 +19,9 @@ Useful options:
     --bbox S W N E     area to keep (default 10 -25 70 65: Europe, N Africa, Middle East)
     --res 0.5          output grid spacing in degrees; must be a multiple of the source spacing
                        (0.25 for --resol 0p25). Smaller = sharper map but a bigger file.
-    --maxstep 90       forecast hours to download (3-hourly). 90 covers a run that is up to
-                       about 18 h old plus the page's 72 h window.
+    --maxstep 102      forecast hours to download (3-hourly). 102 lets the page show the 12 h
+                       precipitation total across its whole 72 h window; 06/18 UTC runs only
+                       exist to 90 h, so the script uses 90 for those automatically.
     --resol 0p25       ECMWF resolution key. ECMWF added a 0.1 degree (about 9 km) product on
                        20 Oct 2026; try --resol 0p1 --res 0.1 once 0p25 works (untested).
     --source ecmwf     ecmwf | aws | azure | google (mirrors; use one if ecmwf is slow)
@@ -40,11 +41,16 @@ import numpy as np
 
 KT = 1.943844  # m/s -> knots
 OUT_VARS = ['temperature_2m', 'dew_point_2m', 'wind_speed_10m', 'wind_direction_10m',
-            'wind_gusts_10m', 'precipitation', 'cloud_cover', 'pressure_msl', 'cape']
+            'wind_gusts_10m', 'precipitation', 'cloud_cover', 'pressure_msl', 'cape',
+            'snowfall', 'wave_height', 'wave_direction', 'wave_period', 'freezing_level']
 # ECMWF short names to try for each quantity, in order (open-data names differ between docs versions)
 CAND = {'2t': ['2t'], '2d': ['2d'], '10u': ['10u'], '10v': ['10v'],
         'gust': ['10fg', 'fg10', '10fg3', 'i10fg'], 'tp': ['tp'], 'tcc': ['tcc'],
-        'msl': ['msl'], 'cape': ['cape', 'mucape']}
+        'msl': ['msl'], 'cape': ['cape', 'mucape'],
+        'sf': ['sf'],                       # snowfall (water equivalent, accumulated, m)
+        'swh': ['swh'], 'mwd': ['mwd'], 'mwp': ['mwp', 'pp1d'],   # waves: height, direction, period (wave stream)
+        'deg0l': ['deg0l', '0l']}           # freezing level height (m)
+EXTRA = {'swh': {'stream': 'wave'}, 'mwd': {'stream': 'wave'}, 'mwp': {'stream': 'wave'}}
 
 
 def quantize(a):
@@ -104,6 +110,12 @@ def demo(args):
         out['cloud_cover'].append(np.clip(50 + 45 * np.sin(LA / 7 + LO / 9 + h / 12), 0, 100))
         out['pressure_msl'].append(1013 + 18 * np.sin(LO / 12 + h / 30) * np.cos(LA / 10))
         out['cape'].append(np.maximum(0, 900 * np.sin(LA / 5) * np.sin(h / 8)))
+        out['snowfall'].append(np.where(t < 2, np.maximum(0, 1.5 * np.sin(LA / 4 + h / 9) * np.cos(LO / 6)), 0))
+        sea = np.where((LO < 30) & (LA < 62) & ((LA > 36) | (LO < -6)), 1.0, np.nan)   # crude "sea" mask
+        out['wave_height'].append(sea * (1.8 + 1.4 * np.sin(LO / 9 + h / 14) * np.cos(LA / 8)))
+        out['wave_direction'].append(sea * ((250 + 40 * np.sin(LA / 9 + h / 30)) % 360))
+        out['wave_period'].append(sea * (7 + 2 * np.sin(LO / 7 + h / 20)))
+        out['freezing_level'].append(np.maximum(0, 2800 - 55 * (LA - 40) + 400 * np.sin(h / 12)))
     data = {k: np.stack(v) for k, v in out.items()}
     return run, steps, lats, lons, res, data, [], True
 
@@ -165,17 +177,26 @@ def download(args):
     except ImportError as e:
         sys.exit(f'Missing package ({e}). Run:  pip install ecmwf-opendata eccodes numpy')
     client = Client(source=args.source, model='ifs', resol=args.resol)
-    steps = list(range(0, args.maxstep + 1, 3))
-    req = {'type': 'fc', 'step': steps}
+    maxstep = min(args.maxstep, 90)
     date = hour = None
     try:
-        latest = client.latest(type='fc', param='2t', step=steps[-1])
+        latest = client.latest(type='fc', param='2t', step=maxstep)
         date, hour = latest.strftime('%Y%m%d'), latest.hour
         run = latest.replace(tzinfo=None)
         print(f'Latest available run: {latest:%Y-%m-%d %H}Z')
+        # 00/12 UTC runs go beyond 90 h; use that if the run is already complete that far
+        if args.maxstep > 90 and hour in (0, 12):
+            try:
+                if client.latest(type='fc', param='2t', step=args.maxstep) == latest:
+                    maxstep = args.maxstep
+            except Exception:
+                pass
     except Exception as e:
         print(f'Could not ask for the latest run ({e}); using the client default.')
         run = None
+    steps = list(range(0, maxstep + 1, 3))
+    print(f'Forecast steps: 0..{maxstep} h')
+    req = {'type': 'fc', 'step': steps}
     if date:
         req.update(date=date, time=hour)
     os.makedirs(args.cache, exist_ok=True)
@@ -190,7 +211,7 @@ def download(args):
             try:
                 if not os.path.exists(target):
                     print(f'Downloading {sn} ({len(steps)} steps)...')
-                    r = client.retrieve(param=sn, target=target, **req)
+                    r = client.retrieve(param=sn, target=target, **req, **EXTRA.get(key, {}))
                     if run is None and getattr(r, 'datetime', None):
                         run = r.datetime.replace(tzinfo=None)
                 fields = read_grib(target, grid, args.bbox, args.res)
@@ -229,6 +250,19 @@ def download(args):
         tp = got['tp']
         rate = np.diff(tp, axis=0) / np.diff(steps).reshape(-1, 1, 1) * 1000.0
         data['precipitation'] = np.clip(np.concatenate([rate[:1], rate]), 0, None)
+    if 'sf' in got:  # snowfall: accumulated water-equivalent (m) -> cm/h of snow at ~10:1 (1 mm water = 1 cm snow)
+        sf = got['sf']
+        rate = np.diff(sf, axis=0) / np.diff(steps).reshape(-1, 1, 1) * 1000.0
+        data['snowfall'] = np.clip(np.concatenate([rate[:1], rate]), 0, None)
+    wave = lambda a: np.where(a >= 9998, np.nan, a).astype(np.float32)   # land points come back as 9999
+    if 'swh' in got:
+        data['wave_height'] = wave(got['swh'])
+    if 'mwd' in got:
+        data['wave_direction'] = wave(got['mwd'])
+    if 'mwp' in got:
+        data['wave_period'] = wave(got['mwp'])
+    if 'deg0l' in got:
+        data['freezing_level'] = got['deg0l']
     missing = [OUT_VARS[i] for i in range(len(OUT_VARS)) if OUT_VARS[i] not in data]
     return run, steps, grid.lats, grid.lons, args.res, data, missing, False
 
@@ -237,7 +271,7 @@ def main():
     ap = argparse.ArgumentParser(description='ECMWF open data -> ecmwf_grid.js for weather.html')
     ap.add_argument('--bbox', nargs=4, type=float, default=[10, -25, 70, 65], metavar=('S', 'W', 'N', 'E'))
     ap.add_argument('--res', type=float, default=0.5)
-    ap.add_argument('--maxstep', type=int, default=90)
+    ap.add_argument('--maxstep', type=int, default=102)
     ap.add_argument('--resol', default='0p25')
     ap.add_argument('--source', default='ecmwf', choices=['ecmwf', 'aws', 'azure', 'google'])
     ap.add_argument('--cache', default='ecmwf_cache')
