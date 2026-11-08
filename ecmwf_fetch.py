@@ -45,7 +45,7 @@ OUT_VARS = ['temperature_2m', 'dew_point_2m', 'wind_speed_10m', 'wind_direction_
             'snowfall', 'wave_height', 'wave_direction', 'wave_period', 'freezing_level']
 # ECMWF short names to try for each quantity, in order (open-data names differ between docs versions)
 CAND = {'2t': ['2t'], '2d': ['2d'], '10u': ['10u'], '10v': ['10v'],
-        'gust': ['10fg', 'fg10', '10fg3', 'i10fg'], 'tp': ['tp'], 'tcc': ['tcc'],
+        'gust': ['10fg', 'fg10', '10fg3', 'i10fg', 'fg310', 'gust'], 'tp': ['tp'], 'tcc': ['tcc'],
         'msl': ['msl'], 'cape': ['cape', 'mucape'],
         'sf': ['sf'],                       # snowfall (water equivalent, accumulated, m)
         'swh': ['swh'], 'mwd': ['mwd'], 'mwp': ['mwp', 'pp1d'],   # waves: height, direction, period (wave stream)
@@ -255,8 +255,11 @@ def download(args):
                     if run is None and getattr(r, 'datetime', None):
                         run = r.datetime.replace(tzinfo=None)
                 fields = read_grib(target, grid, args.bbox, args.res)
+                if key == 'gust' and 0 not in fields and len(steps) > 1 and steps[1] in fields:
+                    fields[0] = fields[steps[1]]   # gusts are a maximum since the previous step, so step 0 does not exist: reuse the first
                 if not all(s in fields for s in steps):
-                    raise RuntimeError('some forecast steps are missing in the file')
+                    miss = [s for s in steps if s not in fields]
+                    raise RuntimeError(f'forecast steps missing in the file: {miss[:6]}{"..." if len(miss) > 6 else ""} (got {len(fields)} of {len(steps)})')
                 got[key] = np.stack([fields[s] for s in steps])
                 print(f'  {key}: using ECMWF parameter "{sn}"')
                 break
