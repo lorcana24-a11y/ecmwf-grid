@@ -42,14 +42,17 @@ import numpy as np
 KT = 1.943844  # m/s -> knots
 OUT_VARS = ['temperature_2m', 'dew_point_2m', 'wind_speed_10m', 'wind_direction_10m',
             'wind_gusts_10m', 'precipitation', 'cloud_cover', 'pressure_msl', 'cape',
-            'snowfall', 'wave_height', 'wave_direction', 'wave_period', 'freezing_level']
+            'snowfall', 'wave_height', 'wave_direction', 'wave_period', 'freezing_level',
+            'precip_type', 'skin_temperature']
 # ECMWF short names to try for each quantity, in order (open-data names differ between docs versions)
 CAND = {'2t': ['2t'], '2d': ['2d'], '10u': ['10u'], '10v': ['10v'],
         'gust': ['10fg', 'fg10', '10fg3', 'i10fg', 'fg310', 'gust'], 'tp': ['tp'], 'tcc': ['tcc'],
         'msl': ['msl'], 'cape': ['cape', 'mucape'],
         'sf': ['sf'],                       # snowfall (water equivalent, accumulated, m)
         'swh': ['swh'], 'mwd': ['mwd'], 'mwp': ['mwp', 'pp1d'],   # waves: height, direction, period (wave stream)
-        'deg0l': ['deg0l', '0l']}           # freezing level height (m)
+        'deg0l': ['deg0l', '0l'],           # freezing level height (m)
+        'ptype': ['ptype'],                 # precipitation type, WMO code table 4.201 (0 none, 1 rain, 3 freezing rain, 5 snow, 6 wet snow, 7 rain+snow, 8 ice pellets, 12 freezing drizzle)
+        'skt': ['skt']}                     # skin (ground / sea surface) temperature, K
 EXTRA = {'swh': {'stream': 'wave'}, 'mwd': {'stream': 'wave'}, 'mwp': {'stream': 'wave'}}
 
 
@@ -116,6 +119,13 @@ def demo(args):
         out['wave_direction'].append(sea * ((250 + 40 * np.sin(LA / 9 + h / 30)) % 360))
         out['wave_period'].append(sea * (7 + 2 * np.sin(LO / 7 + h / 20)))
         out['freezing_level'].append(np.maximum(0, 2800 - 55 * (LA - 40) + 400 * np.sin(h / 12)))
+        skt = t - 1.5 - 2 * np.cos(hh / 24 * 2 * np.pi)          # ground colder than the air at night
+        out['skin_temperature'].append(skt)
+        pr = out['precipitation'][-1]
+        code = np.where(t > 3, 1, np.where(t > 1, 7, np.where(t > 0, 6, 5)))
+        code = np.where((skt <= 0) & (t > 0.5) & (t <= 3), np.where(pr > 0.5, 3, 12), code)   # warm air over frozen ground
+        code = np.where((t > -2) & (t <= 0) & (np.sin(LO / 5 + h / 7) > 0.7), 8, code)
+        out['precip_type'].append(np.where(pr >= 0.1, code, 0).astype(float))
     data = {k: np.stack(v) for k, v in out.items()}
     return run, steps, lats, lons, res, data, [], True
 
@@ -255,7 +265,7 @@ def download(args):
                     if run is None and getattr(r, 'datetime', None):
                         run = r.datetime.replace(tzinfo=None)
                 fields = read_grib(target, grid, args.bbox, args.res)
-                if key == 'gust' and 0 not in fields and len(steps) > 1 and steps[1] in fields:
+                if key in ('gust', 'ptype') and 0 not in fields and len(steps) > 1 and steps[1] in fields:
                     fields[0] = fields[steps[1]]   # gusts are a maximum since the previous step, so step 0 does not exist: reuse the first
                 if not all(s in fields for s in steps):
                     miss = [s for s in steps if s not in fields]
@@ -324,6 +334,10 @@ def download(args):
         data['wave_period'] = wave(got['mwp'])
     if 'deg0l' in got:
         data['freezing_level'] = got['deg0l']
+    if 'ptype' in got:   # a category code, never averaged: the grid is subsampled, and the page reads it without blending
+        data['precip_type'] = np.round(np.where(np.isfinite(got['ptype']), got['ptype'], 0)).astype(np.float32)
+    if 'skt' in got:
+        data['skin_temperature'] = got['skt'] - 273.15
     missing = [OUT_VARS[i] for i in range(len(OUT_VARS)) if OUT_VARS[i] not in data]
     return run, steps, grid.lats, grid.lons, args.res, data, missing, False
 
